@@ -56,12 +56,11 @@ async function searchDoctolib(page, practitioner) {
 
             const telEl = document.querySelector('.dl-profile-practice-phone, [href^="tel:"]');
             if (telEl) {
-              const telMatch = telEl.innerText.match(/(?:(?:\+|00)33|0)\s*[1-9](?:[\s.-]*\d{2}){4}/);
-              if (telMatch) res.telephone = telMatch[0].replace(/[\s.-]/g, '');
+              res.telephone = telEl.innerText.replace(/[^\d+]/g, '');
             } else {
                // Fallback global par regex si pas trouvé dans les éléments clés
-               const telMatch = document.body.innerText.match(/(?:(?:\+|00)33|0)[ -]?[1-9](?:[ -]*\d{2}){4}/);
-               if (telMatch) res.telephone = telMatch[0].replace(/[\s.-]/g, '');
+               const telMatch = document.body.innerText.match(/(?:(?:\+|00)33|0)[ -]?[1-9](?:[ -]*\d{2}){4,}/);
+               if (telMatch) res.telephone = telMatch[0].replace(/[^\d+]/g, '');
             }
 
             const bodyText = document.body.innerText;

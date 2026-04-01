@@ -99,12 +99,8 @@ function log(msg) {
 
 function cleanPhone(text) {
   if (!text) return '';
-  // Ne garde que les chiffres
-  const digits = text.replace(/\D/g, '');
-  if (digits.length < 10) return '';
-  // Format international simple ou local (0X XX XX XX XX)
-  const last10 = digits.slice(-10);
-  return '0' + last10.slice(1);
+  // Garde tous les chiffres et le signe +
+  return text.replace(/[^\d+]/g, '');
 }
 
 // ─────────────────────────────────────────────
