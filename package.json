@@ -4,13 +4,16 @@
   "description": "Scraper PagesJaunes – Ophtalmologues Zone 3 (33 départements)",
   "main": "scraper_ophtalmologues_zone3.js",
   "scripts": {
-    "start":  "node scraper_ophtalmologues_zone3.js",
+    "start": "node server.js",
     "phase1": "node scraper_ophtalmologues_zone3.js --phase1",
     "phase2": "node scraper_ophtalmologues_zone3.js --phase2"
   },
   "dependencies": {
-    "playwright": "^1.44.0",
-    "exceljs":    "^4.4.0"
+    "body-parser": "^2.2.2",
+    "cookie-parser": "^1.4.7",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "playwright": "^1.44.0"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -1,15 +1,17 @@
 /**
  * Scraper Ophtalmologues Zone 3 – PagesJaunes / PagesBlanches
  * ============================================================
- * Connexion : Chrome avec --remote-debugging-port=9222
- *
- * Lancer Chrome AVANT ce script :
- *   google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-scraper
- *
  * Usage :
- *   node scraper_ophtalmologues_zone3.js          → Phase 1 + Phase 2
- *   node scraper_ophtalmologues_zone3.js --phase1  → Phase 1 uniquement
- *   node scraper_ophtalmologues_zone3.js --phase2  → Phase 2 uniquement (links déjà dans progress.json)
+ *   node scraper_ophtalmologues_zone3.js                    → Phase 1 + Phase 2 (CDP)
+ *   node scraper_ophtalmologues_zone3.js --phase2           → Phase 2 via CDP (Chrome visible)
+ *   node scraper_ophtalmologues_zone3.js --phase2 --headless → Phase 2 headless (aucune fenêtre)
+ *
+ * Mode headless : ne nécessite PAS de Chrome préalablement ouvert.
+ *   Le script lance lui-même Chromium en arrière-plan.
+ *   La session LinkedIn est lue depuis /tmp/chrome-scraper (même user-data-dir).
+ *
+ * Mode CDP (défaut) : nécessite Chrome lancé avec :
+ *   google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-scraper
  */
 
 const { chromium } = require('playwright');
@@ -23,10 +25,11 @@ const https = require('https');
 // ─────────────────────────────────────────────
 // CONFIGURATION
 // ─────────────────────────────────────────────
-const CDP_URL = 'http://localhost:9222';
-const PROGRESS_FILE = path.resolve('progress.json');
-const OUTPUT_FILE = path.resolve('ophtalmologues_zone3.xlsx');
-const LINK_PATTERN = /\/pros\/\d+/;
+const CDP_URL        = 'http://localhost:9222';
+const PROGRESS_FILE  = path.resolve('progress.json');
+const OUTPUT_FILE    = path.resolve('ophtalmologues_zone3.xlsx');
+const LINK_PATTERN   = /\/pros\/\d+/;
+const USER_DATA_DIR  = '/tmp/chrome-scraper'; // Partagé avec Chrome CDP – contient session LinkedIn
 
 const DEPARTEMENTS = [
   // Occitanie
@@ -100,7 +103,16 @@ function log(msg) {
 function cleanPhone(text) {
   if (!text) return '';
   // Garde tous les chiffres et le signe +
-  return text.replace(/[^\d+]/g, '');
+  let digits = text.replace(/[^\d+]/g, '');
+  
+  // Déduplication si répétition exacte (ex: 0553...0553...)
+  if (digits.length >= 10 && digits.length % 2 === 0) {
+    const half = digits.length / 2;
+    if (digits.slice(0, half) === digits.slice(half)) {
+      return digits.slice(0, half);
+    }
+  }
+  return digits;
 }
 
 // ─────────────────────────────────────────────
@@ -385,6 +397,12 @@ async function extractFiche(page, url, depInfo) {
     url_pagesjaunes: url
   };
 
+  const title = await page.title().catch(() => '');
+  if (title.includes('Sécurité') || title.includes('Security') || title.includes('Just a moment')) {
+    log(`  ⚠️  Page de sécurité détectée pour ${url}. On passe.`);
+    return null;
+  }
+
   try {
     // Nom du médecin
     // 📞 Extraction du téléphone (Bouton "Afficher le numéro")
@@ -413,17 +431,33 @@ async function extractFiche(page, url, depInfo) {
     });
 
     const rawCabinet = await page.evaluate(() => {
-      const el = document.querySelector('.company-name, [itemprop="legalName"], .lb-establishment-name, .workplace-name, .bi-denomination h3');
-      const text = el ? el.textContent.trim() : '';
-      
-      // Filtre de mots-clés : un centre doit ressembler à un centre (pas à un nom de personne seule)
-      const centerKeywords = ['centre', 'cabinet', 'clinique', 'ophtalmolog', 'groupe', 'scm', 'selarl', 'institut', 'fondation', 'hopital'];
+      // Sélecteurs étendus pour mieux capturer le nom du centre/cabinet
+      const selectors = [
+        '.company-name', '[itemprop="legalName"]', '.lb-establishment-name',
+        '.workplace-name', '.bi-denomination h3', '.bi-pro-name-header h2',
+        '.denomination-links span', '.address-bloc .company'
+      ];
+      let text = '';
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) { text = el.textContent.trim(); if (text) break; }
+      }
+      if (!text) return '';
+
+      // Mots-clés typiques d'une structure médicale collective
+      const centerKeywords = [
+        'centre', 'cabinet', 'clinique', 'ophtalmolog', 'groupe', 'scm', 'selarl', 'scp',
+        'institut', 'fondation', 'hopital', 'hôpital', 'vision', 'polyclinique',
+        'association', 'medic', 'médic', 'opto', 'lentilles', 'santé', 'sante'
+      ];
       const isCenter = centerKeywords.some(kw => text.toLowerCase().includes(kw));
-      
-      // Si ce n'est pas un nom de centre connu, et que ça ressemble à un "Prénom Nom" (2-3 mots), on l'exclut
-      const words = text.split(' ').filter(w => w.length > 0);
-      if (!isCenter && words.length <= 3) return '';
-      
+
+      // Exclure les noms qui ressemblent à "Dr Prénom NOM" ou "Prénom NOM" seuls (≤ 3 mots, sans keyword)
+      const words = text.split(/\s+/).filter(w => w.length > 0);
+      const looksLikePersonName = !isCenter && words.length <= 3 &&
+        (words[0].toLowerCase().startsWith('dr') || words.every(w => /^[A-ZÀ-ÿa-z'-]+$/.test(w)));
+      if (looksLikePersonName) return '';
+
       return text;
     });
 
@@ -557,37 +591,56 @@ async function enrichProfile(page, practitioner, linkedinCredentials = null) {
 // ─────────────────────────────────────────────
 // SYNC GOOGLE SHEETS
 // ─────────────────────────────────────────────
-async function sendToGoogleWebhook(webhookUrl, data) {
+async function sendToGoogleWebhook(webhookUrl, data, retries = 3) {
   if (!webhookUrl) return;
   
-  try {
-    const emailList = [...new Set(data.emails || [])].filter(e => e).join(', ');
-    const postData = {
-      departement: data.departement,
-      ville: data.ville,
-      nom: data.nom,
-      cabinet: data.cabinet,
-      nom_linkedin: data.nom_linkedin || '',
-      email: emailList || data.email || '',
-      telephone: data.telephone || '',
-      specialisation: data.specialisation || 'Ophtalmologue',
-      url_linkedin: data.url_linkedin || '',
-      url_doctolib: data.url_doctolib || '',
-      url_pagesjaunes: data.url_pagesjaunes || ''
-    };
+  const emailList = [...new Set(data.emails || [])].filter(e => e).join(', ');
+  const postData = {
+    departement: data.departement,
+    ville: data.ville,
+    nom: data.nom,
+    cabinet: data.cabinet,
+    nom_linkedin: data.nom_linkedin || '',
+    email: emailList || data.email || '',
+    telephone: data.telephone || '',
+    specialisation: data.specialisation || 'Ophtalmologue',
+    url_linkedin: data.url_linkedin || '',
+    url_doctolib: data.url_doctolib || '',
+    url_pagesjaunes: data.url_pagesjaunes || ''
+  };
 
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(postData)
-    });
-    
-    if (!response.ok) {
-      console.error(`    ⚠ Webhook Google: HTTP ${response.status}`);
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(postData),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeout);
+
+      if (response.ok) {
+        return true; // Success
+      } else {
+        console.error(`    ⚠ Webhook Google: HTTP ${response.status} (Tentative ${attempt}/${retries})`);
+      }
+    } catch (e) {
+      const isTimeout = e.name === 'AbortError';
+      const errorMsg = isTimeout ? 'Timeout 10s' : e.message;
+      if (attempt === retries) {
+        console.error(`    ⚠ Échec Webhook Google après ${retries} tentatives: ${errorMsg}`);
+      } else {
+        // Attente exponentielle avant retry
+        const wait = 1000 * attempt;
+        await new Promise(r => setTimeout(r, wait));
+      }
     }
-  } catch (e) {
-    console.error(`    ⚠ Erreur Webhook Google: ${e.message}`);
   }
+  return false;
 }
 
 async function phase2(page, progress, excel, linkedinCredentials = null, webhookUrl = null) {
@@ -611,6 +664,18 @@ async function phase2(page, progress, excel, linkedinCredentials = null, webhook
 
   let count = processedSet.size;
   let sinceLastSave = 0;
+  const startTime = Date.now();
+
+  function printMonitor() {
+    const done = count;
+    const total = allTasks.length;
+    const pct = ((done / total) * 100).toFixed(1);
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    const rate = done > processedSet.size ? ((done - processedSet.size) / (elapsed / 60)).toFixed(1) : '–';
+    const remaining = todo.length - (done - processedSet.size);
+    const eta = rate !== '–' && rate > 0 ? Math.round(remaining / parseFloat(rate)) : '–';
+    log(`📊 MONITOR | ${done}/${total} (${pct}%) | Vitesse: ~${rate} fiches/min | Restantes: ${remaining} | ETA: ${eta !== '–' ? eta + ' min' : '–'}`);
+  }
 
   for (const task of todo) {
     const { url, dep } = task;
@@ -623,6 +688,10 @@ async function phase2(page, progress, excel, linkedinCredentials = null, webhook
     }
 
     const data = await extractFiche(page, url, dep);
+    if (!data) {
+      log(`  ⚠️  Saut de la fiche ${url} (bloqué par sécurité)`);
+      continue;
+    }
 
     // Enrichissement multi-sources (Doctolib, LinkedIn, Site)
     await enrichProfile(page, data, linkedinCredentials);
@@ -635,11 +704,12 @@ async function phase2(page, progress, excel, linkedinCredentials = null, webhook
     progress.processed.push(url);
     sinceLastSave++;
 
-    log(`✓ [${count}] ${data.nom || '(sans nom)'} | ${data.ville} | ${data.telephone || '–'}`);
+    log(`✓ [${count}] ${data.nom || '(sans nom)'}${data.cabinet ? ' @ ' + data.cabinet : ''} | ${data.ville} | 📞${data.telephone || '–'}`);
 
-    // Sauvegarde progress toutes les 10 fiches
+    // Monitor + sauvegarde toutes les 10 fiches
     if (sinceLastSave >= 10) {
       saveProgress(progress);
+      printMonitor();
       sinceLastSave = 0;
     }
 
@@ -657,10 +727,11 @@ async function phase2(page, progress, excel, linkedinCredentials = null, webhook
 // ─────────────────────────────────────────────
 async function main() {
   const args = process.argv.slice(2);
-  const runPhase1 = !args.includes('--phase2');
-  const runPhase2 = !args.includes('--phase1');
-  const depArg = args.find(a => a.startsWith('--dep'));
-  const targetDep = depArg ? depArg.split('=')[1] || args[args.indexOf('--dep') + 1] : null;
+  const runPhase1  = !args.includes('--phase2');
+  const runPhase2  = !args.includes('--phase1');
+  const isHeadless = args.includes('--headless');
+  const depArg     = args.find(a => a.startsWith('--dep'));
+  const targetDep  = depArg ? depArg.split('=')[1] || args[args.indexOf('--dep') + 1] : null;
 
   if (targetDep) {
     const dep = DEPARTEMENTS.find(d => d.code === targetDep);
@@ -668,36 +739,59 @@ async function main() {
       log(`❌ Département ${targetDep} non trouvé.`);
       process.exit(1);
     }
-    // Mutation temporaire pour le run courant
     DEPARTEMENTS.length = 0;
     DEPARTEMENTS.push(dep);
     log(`🎯 Ciblage du département : ${dep.nom} (${dep.code})`);
   }
 
-  log('🔌 Connexion à Chrome via CDP...');
-  let browser;
-  try {
-    browser = await chromium.connectOverCDP(CDP_URL);
-  } catch (err) {
-    console.error(`\n❌ Impossible de se connecter à Chrome sur ${CDP_URL}`);
-    console.error('   Lancez d\'abord Chrome avec :');
-    console.error('   google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-scraper\n');
-    process.exit(1);
+  let browser = null;
+  let context, page;
+
+  if (isHeadless) {
+    // ── MODE HEADLESS ──────────────────────────────────────────
+    // Lance un Chromium headless avec le même user-data-dir
+    // → la session LinkedIn est automatiquement disponible
+    log('🚀 Lancement en mode HEADLESS (aucune fenêtre)...');
+    context = await chromium.launchPersistentContext(USER_DATA_DIR, {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+      ],
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 900 },
+    });
+    const pages = context.pages();
+    page = pages.length ? pages[0] : await context.newPage();
+    log('✅ Chromium headless démarré (session LinkedIn conservée)');
+
+  } else {
+    // ── MODE CDP (Chrome visible existant) ─────────────────────
+    log('🔌 Connexion à Chrome via CDP...');
+    try {
+      browser = await chromium.connectOverCDP(CDP_URL);
+    } catch (err) {
+      console.error(`\n❌ Impossible de se connecter à Chrome sur ${CDP_URL}`);
+      console.error('   Lancez d\'abord Chrome avec :');
+      console.error(`   google-chrome --remote-debugging-port=9222 --user-data-dir=${USER_DATA_DIR}\n`);
+      console.error('   Ou relancez avec --headless pour ne pas avoir besoin de Chrome ouvert.');
+      process.exit(1);
+    }
+    const contexts = browser.contexts();
+    context = contexts.length ? contexts[0] : await browser.newContext();
+    const pages = context.pages();
+    page = pages.length ? pages[0] : await context.newPage();
+    log('✅ Connecté au navigateur Chrome (session active)');
   }
-
-  // Récupérer le contexte et la page existants (session active)
-  const contexts = browser.contexts();
-  const context  = contexts.length ? contexts[0] : await browser.newContext();
-  const pages    = context.pages();
-  const page     = pages.length ? pages[0] : await context.newPage();
-
-  log('✅ Connecté au navigateur Chrome (session active)');
 
   // Charger le progrès existant
   const progress = loadProgress();
-  if (!progress.processed) progress.processed = [];
+  if (!progress.processed)      progress.processed = [];
   if (!progress.processed_urls) progress.processed_urls = [];
-  if (!progress.links)     progress.links = {};
+  if (!progress.links)          progress.links = {};
 
   // Initialiser Excel
   const excel = new ExcelHelper(OUTPUT_FILE);
@@ -718,9 +812,7 @@ async function main() {
     if (runPhase1) {
       await phase1(page, progress);
     }
-
     if (runPhase2) {
-      // Login LinkedIn une seule fois au début de la Phase 2 si nécessaire
       if (linkedinCredentials) {
         await loginLinkedIn(page, linkedinCredentials);
       }
@@ -731,9 +823,13 @@ async function main() {
     saveProgress(progress);
     console.error(err);
   } finally {
-    // Ne pas fermer le navigateur (session partagée)
-    log('🔌 Déconnexion du navigateur (Chrome reste ouvert)');
-    await browser.close();
+    if (isHeadless) {
+      await context.close();
+      log('🔌 Navigateur headless fermé.');
+    } else if (browser) {
+      await browser.close();
+      log('🔌 Déconnexion du navigateur (Chrome reste ouvert).');
+    }
   }
 }
 

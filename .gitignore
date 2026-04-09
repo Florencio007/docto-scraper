@@ -3,3 +3,12 @@ node_modules/
 *.jpg
 *.png
 package-lock.json
+config.json
+progress.json
+progress_backup.json
+*.xlsx
+*.log
+venv/
+mamba_root/
+bin/
+.env

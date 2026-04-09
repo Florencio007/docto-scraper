@@ -63,6 +63,14 @@ async function searchDoctolib(page, practitioner) {
                if (telMatch) res.telephone = telMatch[0].replace(/[^\d+]/g, '');
             }
 
+            // Déduplication si répétition exacte
+            if (res.telephone && res.telephone.length >= 10 && res.telephone.length % 2 === 0) {
+              const half = res.telephone.length / 2;
+              if (res.telephone.slice(0, half) === res.telephone.slice(half)) {
+                res.telephone = res.telephone.slice(0, half);
+              }
+            }
+
             const bodyText = document.body.innerText;
             const emailMatches = bodyText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
             if (emailMatches) res.emails = [...new Set(emailMatches)];
